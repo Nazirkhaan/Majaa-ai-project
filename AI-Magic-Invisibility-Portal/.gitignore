@@ -3,3 +3,5 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+# Runtime-downloaded MediaPipe model (hand_landmarker.task)
+models/

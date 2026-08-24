@@ -25,7 +25,7 @@ Built with Python, OpenCV, MediaPipe, and NumPy.
 
 ## Requirements
 
-- Python 3.9 - 3.11
+- Python 3.9 - 3.14
 - Webcam
 - Dependencies listed in `requirements.txt`
 
@@ -44,9 +44,15 @@ Install the dependencies:
 pip install -r requirements.txt
 ```
 
-> **Note on MediaPipe versions**: MediaPipe 0.11+ removed the legacy
-> `mp.solutions.hands` API used by this project. `requirements.txt` pins
-> `mediapipe>=0.10.7,<0.11.0` to keep the classic API working.
+On first run the app downloads the MediaPipe hand landmarker model
+(`hand_landmarker.task`, ~7.8 MB) into `models/` automatically. You can instead
+download it manually and pass the path to `GestureRecognizer`:
+
+```bash
+mkdir -p models
+curl -L -o models/hand_landmarker.task \
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+```
 
 ## Usage
 
@@ -94,8 +100,7 @@ AI-Magic-Invisibility-Portal/
 ## How It Works
 
 1. Each frame is captured from the webcam and mirrored horizontally.
-2. MediaPipe Hands locates the hand; the index fingertip (EMA-smoothed) drives the
-   portal position and the thumb-index pinch distance drives its radius.
+2. The MediaPipe HandLandmarker (Tasks API) locates the hand; the index fingertip (EMA-smoothed) drives the portal position and the thumb-index pinch distance drives its radius.
 3. Gestures are classified from finger-extended states and debounced through a
    1-second hold timer.
 4. A feathered circular/polygonal mask blends the pre-captured background into the

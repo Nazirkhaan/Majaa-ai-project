@@ -1,11 +1,12 @@
 """MediaPipe hand tracking, gesture state machine, and portal shape/size estimation.
 
-This module wraps MediaPipe's Hands solution and exposes a high-level API that
-the main loop can use to drive the invisibility portal:
+This module uses MediaPipe's **Tasks API** (``HandLandmarker``), the only hand
+tracking API shipped in MediaPipe 0.11+ / 1.x. The legacy ``mp.solutions.hands``
+API used by older releases was removed there and has no prebuilt wheels for
+Python 3.12+, so this implementation targets the Tasks API (Python 3.9 - 3.14).
 
-* Continuous, de-jittered portal center (EMA-smoothed index finger tip).
-* A dynamic portal radius derived from the thumb<->index pinch distance.
-* Debounced gesture triggers guarded by a 1-second hold timer.
+The model (``hand_landmarker.task``) is downloaded automatically on first use
+to ``models/`` next to this module unless an explicit ``model_path`` is given.
 
 Coordinate convention: all returned pixel coordinates refer to the *mirrored*
 frame handed to :meth:`GestureRecognizer.process`, so they align with what the
@@ -15,21 +16,25 @@ user sees on screen.
 from __future__ import annotations
 
 import time
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 
 import cv2
+import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
-# MediaPipe layout differs across releases: classic wheels expose the legacy
-# API as ``mediapipe.solutions``, while newer single-module builds place it at
-# ``mediapipe.python.solutions``. Try the standard path first, then fall back.
-try:  # pragma: no cover - depends on the installed wheel
-    from mediapipe.solutions import hands as _mp_hands  # type: ignore[attr-defined]
-except (ImportError, ModuleNotFoundError):
-    from mediapipe.python.solutions import hands as _mp_hands
+# Official MediaPipe hand landmarker model (float16, ~7.8 MB).
+HAND_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
 
-# Hand landmark indices (see mediapipe.solutions.hands.HandLandmark).
+# Hand landmark indices (standard 21-landmark hand topology).
 _THUMB_TIP = 4
 _THUMB_IP = 3
 _THUMB_MCP = 2
@@ -72,12 +77,55 @@ class GestureResult:
     hand_visible: bool = False
 
 
+def _ensure_model_file(model_path: str | None = None) -> str:
+    """Return a usable model path, downloading the model if it is missing.
+
+    Args:
+        model_path: Optional explicit path to ``hand_landmarker.task``. When
+            omitted, ``models/hand_landmarker.task`` next to this module is used.
+
+    Returns:
+        The resolved, existing model file path.
+
+    Raises:
+        RuntimeError: If the model cannot be downloaded.
+    """
+    path = Path(model_path) if model_path else DEFAULT_MODEL_PATH
+    if path.exists():
+        return str(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Hand landmarker model not found at {path}")
+    print(f"[INFO] Downloading from {HAND_LANDMARKER_MODEL_URL} ...")
+
+    request = urllib.request.Request(HAND_LANDMARKER_MODEL_URL, headers={"User-Agent": "AI-Magic-Invisibility-Portal"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response, open(path, "wb") as handle:
+            total = int(response.headers.get("Content-Length", 0)) or None
+            downloaded = 0
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    print(f"\r[INFO] Downloading model: {downloaded / 1_000_000:.1f} / {total / 1_000_000:.1f} MB", end="", flush=True)
+        if total:
+            print()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download the hand landmarker model to {path}: {exc}") from exc
+
+    return str(path)
+
+
 class GestureRecognizer:
     """Tracks a hand and turns MediaPipe landmarks into portal parameters."""
 
     def __init__(
         self,
         *,
+        model_path: str | None = None,
         max_num_hands: int = 1,
         min_detection_confidence: float = 0.7,
         min_tracking_confidence: float = 0.7,
@@ -90,10 +138,12 @@ class GestureRecognizer:
         """Configure the recognizer.
 
         Args:
+            model_path: Optional path to the ``hand_landmarker.task`` model.
+                Downloaded automatically to ``models/`` when omitted.
             max_num_hands: Maximum hands tracked simultaneously.
-            min_detection_confidence: MediaPipe detection confidence threshold.
-            min_tracking_confidence: MediaPipe tracking confidence threshold.
-            smoothing_alpha: EMA weight (0..1) for portal position. Higher = snappier.
+            min_detection_confidence: Hand detection confidence threshold.
+            min_tracking_confidence: Tracking confidence threshold.
+            smoothing_alpha: EMA weight (0..1) for portal position.
             min_radius: Lower clamp for the portal radius (px).
             max_radius: Upper clamp for the portal radius (px).
             radius_scale: Multiplier applied to the thumb<->index pinch distance.
@@ -105,12 +155,17 @@ class GestureRecognizer:
         self._alpha = float(smoothing_alpha)
         self._hold_seconds = float(hold_seconds)
 
-        self._hands = _mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence,
+        model_file = _ensure_model_file(model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=model_file),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=min_detection_confidence,
+            min_hand_presence_confidence=min_tracking_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
+        self._landmarker = vision.HandLandmarker.create_from_options(options)
+        self._last_timestamp_ms: int = 0
 
         # Smoothing / state machine state.
         self._smooth_pos: tuple[float, float] | None = None
@@ -138,13 +193,14 @@ class GestureRecognizer:
         now = time.monotonic() if timestamp is None else timestamp
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self._hands.process(rgb)
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = self._landmarker.detect_for_video(image, self._next_timestamp_ms(now))
 
-        if not results.multi_hand_landmarks:
+        if not results.hand_landmarks:
             self._reset_tracking()
             return GestureResult(hand_visible=False)
 
-        landmarks = results.multi_hand_landmarks[0].landmark
+        landmarks = results.hand_landmarks[0]
         height, width = frame_bgr.shape[:2]
 
         position = self._smooth_position(
@@ -257,6 +313,14 @@ class GestureRecognizer:
         return None
 
     # ----------------------------------------------------------------- helpers
+
+    def _next_timestamp_ms(self, now: float) -> int:
+        """Return a strictly increasing timestamp (ms) required by VIDEO mode."""
+        timestamp_ms = int(now * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+        return timestamp_ms
 
     def _smooth_position(self, raw: tuple[float, float]) -> tuple[float, float]:
         """Exponential moving average to suppress fingertip jitter."""
