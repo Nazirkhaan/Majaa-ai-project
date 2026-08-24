@@ -1,0 +1,7 @@
+# AI Magic Invisibility Portal - Dependencies
+# Python 3.9 - 3.11 recommended (MediaPipe provides prebuilt wheels for these versions)
+
+opencv-python>=4.8.0
+# 0.11+ dropped the legacy `mp.solutions.hands` API used by this project.
+mediapipe>=0.10.7,<0.11.0
+numpy>=1.24.0
