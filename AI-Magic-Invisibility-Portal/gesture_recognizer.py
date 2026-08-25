@@ -1,12 +1,16 @@
-"""MediaPipe hand tracking, gesture state machine, and portal shape/size estimation.
+"""Two-hand tracking (MediaPipe Tasks API), gesture state machine, and pinch math.
 
-This module uses MediaPipe's **Tasks API** (``HandLandmarker``), the only hand
-tracking API shipped in MediaPipe 0.11+ / 1.x. The legacy ``mp.solutions.hands``
-API used by older releases was removed there and has no prebuilt wheels for
-Python 3.12+, so this implementation targets the Tasks API (Python 3.9 - 3.14).
+This module uses MediaPipe's modern Tasks API (``HandLandmarker``), which is the
+only hand tracking API shipped in MediaPipe 0.11+ / 1.x and is required on
+Python 3.12+. The legacy ``mp.solutions.hands`` API was removed there.
 
-The model (``hand_landmarker.task``) is downloaded automatically on first use
-to ``models/`` next to this module unless an explicit ``model_path`` is given.
+It tracks up to two hands simultaneously and reports, per hand:
+
+* The 21-landmark pixel skeleton (for on-screen overlay drawing).
+* A pinch distance (thumb<->index) and a size-normalized pinch ratio.
+* A classified control gesture.
+
+A single debounced state machine turns the first hand's gesture into actions.
 
 Coordinate convention: all returned pixel coordinates refer to the *mirrored*
 frame handed to :meth:`GestureRecognizer.process`, so they align with what the
@@ -35,28 +39,36 @@ HAND_LANDMARKER_MODEL_URL = (
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
 
 # Hand landmark indices (standard 21-landmark hand topology).
-_THUMB_TIP = 4
-_THUMB_IP = 3
+_WRIST = 0
 _THUMB_MCP = 2
-_INDEX_TIP = 8
-_INDEX_PIP = 6
+_THUMB_IP = 3
+_THUMB_TIP = 4
 _INDEX_MCP = 5
-_MIDDLE_TIP = 12
-_MIDDLE_PIP = 10
+_INDEX_PIP = 6
+_INDEX_TIP = 8
 _MIDDLE_MCP = 9
 _RING_TIP = 16
 _RING_PIP = 14
-_RING_MCP = 13
 _PINKY_TIP = 20
 _PINKY_PIP = 18
 _PINKY_MCP = 17
 
+# Standard MediaPipe hand skeleton connections (bone pairs to draw).
+HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                 # palm base
+)
+
 
 class Gesture(Enum):
-    """High-level gestures that control the invisibility portal."""
+    """High-level gestures that control the invisibility effect."""
 
     OK_SIGN = auto()        # capture / refresh background
-    PEACE_SIGN = auto()     # toggle portal visibility
+    PEACE_SIGN = auto()     # toggle ghost visibility
     CLOSED_FIST = auto()    # pause / resume the effect
     OPEN_PALM = auto()      # reset to default state
 
@@ -67,14 +79,24 @@ class Gesture(Enum):
 
 
 @dataclass(frozen=True)
+class HandInfo:
+    """Per-hand tracking data for one frame."""
+
+    handedness: str = ""
+    landmarks: tuple[tuple[float, float], ...] = ()
+    index_tip: tuple[float, float] = (0.0, 0.0)
+    pinch_px: float = 0.0
+    pinch_ratio: float = 0.0
+    gesture: Gesture | None = None
+
+
+@dataclass(frozen=True)
 class GestureResult:
     """Per-frame output of :meth:`GestureRecognizer.process`."""
 
-    position: tuple[float, float] | None = None
-    radius: float | None = None
-    gesture: Gesture | None = None
+    hands: tuple[HandInfo, ...] = ()
+    hand_count: int = 0
     action: Gesture | None = None
-    hand_visible: bool = False
 
 
 def _ensure_model_file(model_path: str | None = None) -> str:
@@ -120,19 +142,15 @@ def _ensure_model_file(model_path: str | None = None) -> str:
 
 
 class GestureRecognizer:
-    """Tracks a hand and turns MediaPipe landmarks into portal parameters."""
+    """Tracks up to two hands and turns their landmarks into usable data."""
 
     def __init__(
         self,
         *,
         model_path: str | None = None,
-        max_num_hands: int = 1,
+        max_num_hands: int = 2,
         min_detection_confidence: float = 0.7,
         min_tracking_confidence: float = 0.7,
-        smoothing_alpha: float = 0.35,
-        min_radius: float = 20.0,
-        max_radius: float = 250.0,
-        radius_scale: float = 2.0,
         hold_seconds: float = 1.0,
     ) -> None:
         """Configure the recognizer.
@@ -140,26 +158,19 @@ class GestureRecognizer:
         Args:
             model_path: Optional path to the ``hand_landmarker.task`` model.
                 Downloaded automatically to ``models/`` when omitted.
-            max_num_hands: Maximum hands tracked simultaneously.
+            max_num_hands: Maximum hands tracked simultaneously (default 2).
             min_detection_confidence: Hand detection confidence threshold.
             min_tracking_confidence: Tracking confidence threshold.
-            smoothing_alpha: EMA weight (0..1) for portal position.
-            min_radius: Lower clamp for the portal radius (px).
-            max_radius: Upper clamp for the portal radius (px).
-            radius_scale: Multiplier applied to the thumb<->index pinch distance.
             hold_seconds: How long a gesture must be held before it triggers.
         """
-        self._min_radius = float(min_radius)
-        self._max_radius = float(max_radius)
-        self._radius_scale = float(radius_scale)
-        self._alpha = float(smoothing_alpha)
+        self._max_num_hands = max(1, int(max_num_hands))
         self._hold_seconds = float(hold_seconds)
 
         model_file = _ensure_model_file(model_path)
         options = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=model_file),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=max_num_hands,
+            num_hands=self._max_num_hands,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_tracking_confidence,
             min_tracking_confidence=min_tracking_confidence,
@@ -167,8 +178,7 @@ class GestureRecognizer:
         self._landmarker = vision.HandLandmarker.create_from_options(options)
         self._last_timestamp_ms: int = 0
 
-        # Smoothing / state machine state.
-        self._smooth_pos: tuple[float, float] | None = None
+        # Gesture state machine state.
         self._current: Gesture | None = None
         self._hold_started: float = 0.0
         self._last_triggered: Gesture | None = None
@@ -187,8 +197,7 @@ class GestureRecognizer:
             timestamp: Optional monotonic timestamp override (mostly for tests).
 
         Returns:
-            A :class:`GestureResult` describing position, radius and any
-            debounced gesture action triggered on this frame.
+            A :class:`GestureResult` with per-hand data and any debounced action.
         """
         now = time.monotonic() if timestamp is None else timestamp
 
@@ -196,33 +205,39 @@ class GestureRecognizer:
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         results = self._landmarker.detect_for_video(image, self._next_timestamp_ms(now))
 
-        if not results.hand_landmarks:
+        hands: list[HandInfo] = []
+        if results.hand_landmarks:
+            height, width = frame_bgr.shape[:2]
+            for index, landmarks in enumerate(results.hand_landmarks):
+                handedness = ""
+                if index < len(results.handedness) and results.handedness[index]:
+                    handedness = results.handedness[index][0].category_name or ""
+
+                pixel = tuple((lm.x * width, lm.y * height) for lm in landmarks)
+                pinch_px = self._landmark_distance_px(landmarks[_THUMB_TIP], landmarks[_INDEX_TIP], width, height)
+                hand_scale = self._landmark_distance_px(landmarks[_WRIST], landmarks[_MIDDLE_MCP], width, height)
+                pinch_ratio = float(np.clip(pinch_px / max(hand_scale * 2.0, 1e-3), 0.0, 1.0))
+
+                hands.append(
+                    HandInfo(
+                        handedness=handedness,
+                        landmarks=pixel,
+                        index_tip=pixel[_INDEX_TIP],
+                        pinch_px=pinch_px,
+                        pinch_ratio=pinch_ratio,
+                        gesture=self._classify_gesture(landmarks),
+                    )
+                )
+
+        if not hands:
             self._reset_tracking()
-            return GestureResult(hand_visible=False)
+            return GestureResult(hands=(), hand_count=0)
 
-        landmarks = results.hand_landmarks[0]
-        height, width = frame_bgr.shape[:2]
-
-        position = self._smooth_position(
-            (landmarks[_INDEX_TIP].x * width, landmarks[_INDEX_TIP].y * height)
-        )
-
-        pinch_px = self._landmark_distance_px(landmarks[_THUMB_TIP], landmarks[_INDEX_TIP], width, height)
-        radius = float(np.clip(pinch_px * self._radius_scale, self._min_radius, self._max_radius))
-
-        gesture = self._classify_gesture(landmarks)
-        action = self._update_state_machine(gesture, now)
-
-        return GestureResult(
-            position=position,
-            radius=radius,
-            gesture=gesture,
-            action=action,
-            hand_visible=True,
-        )
+        action = self._update_state_machine(hands[0].gesture, now)
+        return GestureResult(hands=tuple(hands), hand_count=len(hands), action=action)
 
     def reset(self) -> None:
-        """Forget tracking history and the gesture state machine."""
+        """Forget gesture state machine history."""
         self._reset_tracking()
 
     # ------------------------------------------------------------- gesture math
@@ -231,7 +246,7 @@ class GestureRecognizer:
         """Classify the current hand pose from its landmarks."""
         thumb_ext = self._is_thumb_extended(lm)
         index_ext = self._is_finger_extended(lm, _INDEX_TIP, _INDEX_PIP)
-        middle_ext = self._is_finger_extended(lm, _MIDDLE_TIP, _MIDDLE_PIP)
+        middle_ext = self._is_finger_extended(lm, 12, 10)
         ring_ext = self._is_finger_extended(lm, _RING_TIP, _RING_PIP)
         pinky_ext = self._is_finger_extended(lm, _PINKY_TIP, _PINKY_PIP)
 
@@ -250,13 +265,7 @@ class GestureRecognizer:
         ):
             return Gesture.OK_SIGN
         # Peace: index & middle extended, thumb, ring and pinky folded.
-        if (
-            not thumb_ext
-            and index_ext
-            and middle_ext
-            and not ring_ext
-            and not pinky_ext
-        ):
+        if not thumb_ext and index_ext and middle_ext and not ring_ext and not pinky_ext:
             return Gesture.PEACE_SIGN
         return None
 
@@ -267,11 +276,7 @@ class GestureRecognizer:
 
     @staticmethod
     def _is_thumb_extended(lm) -> bool:
-        """Hand-agnostic thumb check based on reach relative to the index MCP.
-
-        When the thumb is extended its tip is farther from the index knuckle
-        than the thumb IP joint is; when folded it collapses toward the palm.
-        """
+        """Hand-agnostic thumb check based on reach relative to the index MCP."""
         tip_to_index_mcp = GestureRecognizer._landmark_distance(lm[_THUMB_TIP], lm[_INDEX_MCP])
         ip_to_index_mcp = GestureRecognizer._landmark_distance(lm[_THUMB_IP], lm[_INDEX_MCP])
         return bool(tip_to_index_mcp > ip_to_index_mcp + 0.02)
@@ -291,12 +296,7 @@ class GestureRecognizer:
     # ------------------------------------------------------------ state machine
 
     def _update_state_machine(self, gesture: Gesture | None, now: float) -> Gesture | None:
-        """Debounce gesture triggers with a hold timer.
-
-        A gesture must be held continuously for ``hold_seconds`` before firing.
-        After firing, the same gesture cannot re-fire until it has been released
-        (or replaced by another gesture).
-        """
+        """Debounce gesture triggers with a hold timer."""
         if gesture is None:
             self._current = None
             self._hold_started = 0.0
@@ -322,20 +322,8 @@ class GestureRecognizer:
         self._last_timestamp_ms = timestamp_ms
         return timestamp_ms
 
-    def _smooth_position(self, raw: tuple[float, float]) -> tuple[float, float]:
-        """Exponential moving average to suppress fingertip jitter."""
-        if self._smooth_pos is None:
-            self._smooth_pos = raw
-            return raw
-        alpha = self._alpha
-        x = alpha * raw[0] + (1.0 - alpha) * self._smooth_pos[0]
-        y = alpha * raw[1] + (1.0 - alpha) * self._smooth_pos[1]
-        self._smooth_pos = (x, y)
-        return self._smooth_pos
-
     def _reset_tracking(self) -> None:
-        """Reset smoothing and gesture state when the hand is lost."""
-        self._smooth_pos = None
+        """Reset gesture state when no hand is visible."""
         self._current = None
         self._hold_started = 0.0
         self._last_triggered = None

@@ -1,63 +1,47 @@
-"""Portal math, rendering, masking, glowing effects, and background blending.
+"""Ghost compositing: full-body silhouette transparency with a magic glow.
 
-The :class:`PortalRenderer` implements the visual core of the application:
+The shaped portal window is replaced by live selfie segmentation. The person's
+silhouette (a soft mask produced by :class:`segmenter.SelfieSegmenter`) is
+blended toward the pre-captured background to create a "ghost" / see-through
+body effect. A pinch gesture controls how transparent the ghost becomes.
 
-1. Stores a baseline background frame to "see through" the portal.
-2. Builds a soft, feathered binary mask (Circle / Square / Hexagon) centered on
-   the tracked fingertip with a dynamic radius.
-3. Blends the pre-captured background into the masked region of the live frame.
-4. Paints a multi-layered glowing border (Gaussian halo + crisp inner rim)
-   using additive color mixing for a neon "magic portal" look.
+Visual treatment:
 
-All heavy lifting uses vectorized NumPy operations to stay close to real-time.
+* Feathered alpha compositing so the body edge stays soft.
+* An additive silhouette glow (Gaussian halo carved around the body boundary)
+  rendered at half resolution for performance.
 """
 
 from __future__ import annotations
-
-from enum import Enum
 
 import cv2
 import numpy as np
 
 
-class PortalShape(Enum):
-    """Supported portal shapes."""
-
-    CIRCLE = "circle"
-    SQUARE = "square"
-    HEXAGON = "hexagon"
-
-
-class PortalRenderer:
-    """Renders the invisibility portal and its glow effects."""
+class GhostCompositor:
+    """Blends the person silhouette into the background to make a ghost."""
 
     def __init__(
         self,
         *,
-        glow_color: tuple[int, int, int] = (255, 180, 40),
+        glow_color: tuple[int, int, int] = (255, 200, 80),
+        glow_intensity: float = 60.0,
         glow_scale: float = 0.5,
-        edge_feather: float = 0.05,
     ) -> None:
-        """Configure the renderer.
+        """Configure the compositor.
 
         Args:
-            glow_color: BGR color used for the portal glow.
+            glow_color: BGR color used for the silhouette glow.
+            glow_intensity: Peak additive brightness of the glow (0..255).
             glow_scale: Downscale factor for glow computation (0.5 = half res).
-            edge_feather: Mask feather size as a fraction of the portal radius.
         """
         self._glow_color = tuple(int(c) for c in glow_color)
+        self._glow_intensity = float(glow_intensity)
         self._glow_scale = float(glow_scale)
-        self._edge_feather = float(edge_feather)
 
         self._bg_frame: np.ndarray | None = None
-        self._shape = PortalShape.CIRCLE
 
     # ------------------------------------------------------------------ public
-
-    @property
-    def shape(self) -> PortalShape:
-        """Currently selected portal shape."""
-        return self._shape
 
     @property
     def background_captured(self) -> bool:
@@ -65,7 +49,7 @@ class PortalRenderer:
         return self._bg_frame is not None
 
     def capture_background(self, frame: np.ndarray) -> bool:
-        """Store *frame* as the baseline background to reveal through the portal.
+        """Store *frame* as the baseline background to reveal through the body.
 
         Returns:
             ``True`` when a frame was stored.
@@ -75,155 +59,72 @@ class PortalRenderer:
         self._bg_frame = frame.copy()
         return True
 
-    def set_shape(self, shape: PortalShape) -> PortalShape:
-        """Select the portal shape explicitly."""
-        self._shape = shape
-        return self._shape
-
-    def cycle_shape(self) -> PortalShape:
-        """Advance to the next portal shape in the enum order."""
-        shapes = list(PortalShape)
-        index = shapes.index(self._shape)
-        self._shape = shapes[(index + 1) % len(shapes)]
-        return self._shape
-
     def compose(
         self,
         frame: np.ndarray,
-        position: tuple[float, float] | None,
-        radius: float | None,
+        person_mask: np.ndarray | None,
+        opacity: float,
         *,
         visible: bool = True,
     ) -> np.ndarray:
-        """Compose the final frame with the invisibility portal applied.
+        """Compose the final frame with the ghost effect applied.
 
         Args:
             frame: Current webcam frame (BGR).
-            position: Portal center in pixel coordinates, or ``None`` to disable.
-            radius: Portal radius in pixels, or ``None`` to disable.
-            visible: Whether the portal effect should be rendered at all.
+            person_mask: Float32 silhouette mask in ``[0, 1]``, or ``None``.
+            opacity: Ghost transparency in ``[0, 1]`` (1 = fully see-through).
+            visible: Whether the ghost effect should be rendered at all.
 
         Returns:
             A new composite BGR frame.
         """
-        if (
-            not self.background_captured
-            or not visible
-            or position is None
-            or radius is None
-        ):
+        if not self.background_captured or not visible or person_mask is None:
             return frame.copy()
 
-        soft_mask = self._build_soft_mask(frame.shape, position, radius)
+        alpha = person_mask * float(np.clip(opacity, 0.0, 1.0))
 
         fg = frame.astype(np.float32)
         bg = self._bg_frame.astype(np.float32)
-        blend = fg * (1.0 - soft_mask[..., None]) + bg * soft_mask[..., None]
+        blend = fg * (1.0 - alpha[..., None]) + bg * alpha[..., None]
         composite = np.clip(blend, 0.0, 255.0).astype(np.uint8)
 
-        glow = self._build_glow(composite.shape, position, radius)
+        glow = self._build_glow(composite.shape, person_mask, float(opacity))
         return cv2.add(composite, glow)
-
-    # ----------------------------------------------------------------- masking
-
-    def _build_soft_mask(
-        self,
-        frame_shape: tuple[int, int, int],
-        center: tuple[float, float],
-        radius: float,
-    ) -> np.ndarray:
-        """Build a feathered binary mask for the selected portal shape.
-
-        Returns:
-            Float32 mask in ``[0, 1]`` where ``1`` marks portal interior.
-        """
-        height, width = frame_shape[:2]
-        points = self._shape_points(center, radius)
-
-        mask = np.zeros((height, width), np.uint8)
-        cv2.fillPoly(mask, [points], 255)
-
-        sigma = max(int(radius * self._edge_feather), 2)
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma)
-        return mask.astype(np.float32) / 255.0
-
-    def _shape_points(self, center: tuple[float, float], radius: float) -> np.ndarray:
-        """Return the polygon vertices for the current shape (int32 Nx2)."""
-        cx, cy = float(center[0]), float(center[1])
-        r = float(radius)
-
-        if self._shape is PortalShape.CIRCLE:
-            angles = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
-            points = np.stack([cx + r * np.cos(angles), cy + r * np.sin(angles)], axis=1)
-        elif self._shape is PortalShape.SQUARE:
-            points = np.array(
-                [[cx - r, cy - r], [cx + r, cy - r], [cx + r, cy + r], [cx - r, cy + r]],
-                dtype=np.float32,
-            )
-        else:  # HEXAGON (pointy-top)
-            angles = np.pi / 6.0 + np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
-            points = np.stack([cx + r * np.cos(angles), cy + r * np.sin(angles)], axis=1)
-
-        return points.astype(np.int32)
 
     # -------------------------------------------------------------------- glow
 
     def _build_glow(
         self,
         frame_shape: tuple[int, int, int],
-        center: tuple[float, float],
-        radius: float,
+        person_mask: np.ndarray,
+        opacity: float,
     ) -> np.ndarray:
-        """Build a multi-layered glowing border (halo + rim) as an additive layer.
+        """Build an additive halo around the person's silhouette.
 
-        The glow is computed at a downscaled resolution for performance and then
-        resized back to the full frame size. Layers:
-
-        * A wide, dim Gaussian halo just outside the portal edge.
-        * A narrow, bright rim tracing the portal perimeter.
-
-        Both are tinted with ``glow_color``; when added to the frame via
-        :func:`cv2.add`, clipping produces a natural neon bloom.
+        The mask is blurred twice with different kernels; subtracting the two
+        produces a soft band that hugs the body boundary. It is tinted with
+        ``glow_color``, scaled by the ghost ``opacity``, and added to the frame,
+        so clipping yields a neon bloom.
         """
         height, width = frame_shape[:2]
         scale = self._glow_scale
         small_w = max(1, round(width * scale))
         small_h = max(1, round(height * scale))
-        small_center = (round(center[0] * scale), round(center[1] * scale))
-        small_radius = max(1.0, radius * scale)
 
-        # Outer soft halo.
-        outer = np.zeros((small_h, small_w), np.float32)
-        cv2.fillPoly(outer, [self._shape_points(small_center, small_radius)], 1.0)
-        outer = cv2.GaussianBlur(outer, (0, 0), sigmaX=max(small_radius * 0.30, 6.0))
+        if scale != 1.0:
+            small_mask = cv2.resize(person_mask, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        else:
+            small_mask = person_mask
 
-        # Inner shape used to carve the ring out of the halo.
-        inner = np.zeros((small_h, small_w), np.float32)
-        cv2.fillPoly(
-            inner,
-            [self._shape_points(small_center, small_radius * 0.80)],
-            1.0,
-        )
-        inner = cv2.GaussianBlur(inner, (0, 0), sigmaX=max(small_radius * 0.10, 3.0))
-
-        halo = np.clip(outer - inner, 0.0, 1.0)
-
-        # Crisp perimeter rim.
-        rim = np.zeros((small_h, small_w), np.float32)
-        cv2.polylines(
-            rim,
-            [self._shape_points(small_center, small_radius)],
-            True,
-            1.0,
-            thickness=max(2, int(2.0 * scale)),
-        )
-        rim = cv2.GaussianBlur(rim, (0, 0), sigmaX=1.0)
+        outer = cv2.GaussianBlur(small_mask, (0, 0), sigmaX=6.0)
+        inner = cv2.GaussianBlur(small_mask, (0, 0), sigmaX=1.5)
+        ring = np.clip(outer - inner, 0.0, 1.0) * float(np.clip(opacity, 0.0, 1.0))
 
         color = np.asarray(self._glow_color, dtype=np.float32)
         glow = np.zeros((small_h, small_w, 3), np.float32)
-        glow[..., 0] = halo * color[0] * 1.0 + rim * color[0] * 1.2
-        glow[..., 1] = halo * color[1] * 1.0 + rim * color[1] * 1.2
-        glow[..., 2] = halo * color[2] * 1.0 + rim * color[2] * 1.2
+        glow[..., 0] = ring * color[0] * self._glow_intensity / 255.0
+        glow[..., 1] = ring * color[1] * self._glow_intensity / 255.0
+        glow[..., 2] = ring * color[2] * self._glow_intensity / 255.0
 
         glow = np.clip(glow, 0.0, 255.0).astype(np.uint8)
         if scale != 1.0:
